@@ -1,5 +1,5 @@
 import argparse
-import argparse
+import hashlib
 import torch
 import os
 from omegaconf import OmegaConf
@@ -24,8 +24,11 @@ from demo_utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller
 parser = argparse.ArgumentParser()
 parser.add_argument("--config_path", type=str, help="Path to the config file")
 parser.add_argument("--checkpoint_path", type=str, help="Path to the checkpoint folder")
-parser.add_argument("--data_path", type=str, help="Path to the dataset")
+prompt_source = parser.add_mutually_exclusive_group(required=True)
+prompt_source.add_argument("--data_path", type=str, help="Path to a newline-delimited prompt file")
+prompt_source.add_argument("--prompt", type=str, help="Generate one video from this prompt")
 parser.add_argument("--output_folder", type=str, help="Output folder")
+parser.add_argument("--output_file", type=str, help="Exact output MP4 path (single --prompt only)")
 parser.add_argument("--num_output_frames", type=int, default=21, help="Number of overlap frames between sliding windows")
 parser.add_argument("--use_ema", action="store_true", help="Whether to use EMA parameters")
 parser.add_argument("--seed", type=int, default=0, help="Random seed")
@@ -33,6 +36,11 @@ parser.add_argument("--i2v", action="store_true", help="Whether to perform I2V (
 parser.add_argument("--report_timing", action="store_true",
                     help="Only tested on A800, for the Causal Forcing++ latency. Not make claims for other hardware like H100. For the result on H100, refer to the reported results in the Self Forcing paper.")
 args = parser.parse_args()
+
+if args.output_file and not args.prompt:
+    parser.error("--output_file can only be used with --prompt")
+if args.prompt and args.i2v:
+    parser.error("--prompt is for text-to-video; use --data_path with --i2v")
 
 # Initialize distributed inference
 if "LOCAL_RANK" in os.environ:
@@ -100,7 +108,10 @@ if args.i2v:
     ])
     dataset = TextImagePairDataset(args.data_path, transform=transform)
 else:
-    dataset = TextDataset(prompt_path=args.data_path)
+    if args.prompt:
+        dataset = [{"prompts": args.prompt, "idx": 0}]
+    else:
+        dataset = TextDataset(prompt_path=args.data_path)
 num_prompts = len(dataset)
 print(f"Number of prompts: {num_prompts}")
 
@@ -151,7 +162,8 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         assert config.num_frame_per_block == 1, "Current I2V only supports the frame-wise model."
         # For image-to-video, batch contains image and caption
         prompt = batch['prompts'][0]  # Get caption from batch
-        output_path = os.path.join(args.output_folder, f'{prompt[:100]}.mp4')
+        prompt_id = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:12]
+        output_path = args.output_file or os.path.join(args.output_folder, f'video-{prompt_id}.mp4')
         if os.path.exists(output_path):
             print('Video has been generated. Pass!')
             continue
@@ -167,7 +179,8 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     else:
         # For text-to-video, batch is just the text prompt
         prompt = batch['prompts'][0]
-        output_path = os.path.join(args.output_folder, f'{prompt[:100]}.mp4')
+        prompt_id = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:12]
+        output_path = args.output_file or os.path.join(args.output_folder, f'video-{prompt_id}.mp4')
         if os.path.exists(output_path):
             print('Video has been generated. Pass!')
             continue
@@ -212,7 +225,8 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     # Clear VAE cache
     pipeline.vae.model.clear_cache()
 
-    output_path = os.path.join(args.output_folder, f'{prompt[:100]}.mp4')
+    prompt_id = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:12]
+    output_path = args.output_file or os.path.join(args.output_folder, f'video-{prompt_id}.mp4')
     write_video(output_path, video[0], fps=16)
 
        

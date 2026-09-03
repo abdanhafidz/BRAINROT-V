@@ -106,6 +106,122 @@ hf download zhuhz22/Causal-Forcing causal-forcing++/framewise-1step.pt --local-d
 
 ### CLI Inference
 
+### BRAINROT-V long-horizon inference
+
+BRAINROT-V is included as an isolated, training-free inference implementation.
+It keeps the frozen model weights and replaces the growing KV history with an
+attention sink, an attention-selected bounded memory bank, and a raw local
+window. Conditional-branch saliency selects one shared token set for both CFG
+branches, and retained keys are re-anchored onto a compressed in-horizon RoPE
+timeline.
+
+Run it on Modal's A100 80 GB runtime:
+
+```powershell
+.\run_brainrot_modal.ps1 `
+  -Prompt "A lone astronaut walking through a neon market in the rain" `
+  -Output "output\brainrot-v.mp4" `
+  -NumFrames 21
+```
+
+Git Bash, WSL, Linux, and macOS can use:
+
+```bash
+./run_brainrot_modal.sh \
+  "A lone astronaut walking through a neon market in the rain" \
+  output/brainrot-v.mp4 21 50 brainrot_v
+```
+
+For an ablation with the unmodified parent cache loop, pass `-Mode baseline`
+(PowerShell) or use `baseline` as the fifth shell argument. Configuration lives
+in `configs/brainrot_v_framewise.yaml`. The default frame-wise AR checkpoint is
+downloaded into the existing `causal-forcing-models` Modal Volume. Because
+FlashAttention does not expose attention probabilities, selected clean-context
+layers use a chunked exact-score side path for saliency; this adds inference
+overhead but no parameters or training.
+
+Generate a matched baseline/Brainrot-V pair from the duration-separated quality
+prompt (same checkpoint, seed, duration, and 50-step scheduler):
+
+```powershell
+.\run_brainrot_comparison.ps1 `
+  -PromptPath "prompts\brainrot_v_quality.txt" `
+  -OutputDir "output\brainrot-v-comparison" `
+  -DurationSeconds 5.0 `
+  -SamplingSteps 50 `
+  -Seed 0
+```
+
+This writes `baseline-causal-forcing.mp4`, `proposed-brainrot-v.mp4`, and an
+`evaluation.txt` manifest to the selected output directory.
+
+For the continuous 60-second, duration-scheduled comparison, submit the baseline
+and Brainrot-V as separate persistent Modal workers. Each `[start-end seconds]`
+line in the prompt file becomes a timed condition while the autoregressive
+self-attention cache remains continuous:
+
+```powershell
+.\run_brainrot_long_scheduled.ps1 `
+  -PromptPath "prompts\brainrot_v_long_horizon_60s.txt" `
+  -RunId "long-horizon-60s-scheduled" `
+  -DurationSeconds 60 `
+  -SamplingSteps 50 `
+  -Seed 0
+```
+
+```bash
+./run_brainrot_long_scheduled.sh \
+  prompts/brainrot_v_long_horizon_60s.txt \
+  long-horizon-60s-scheduled 60 50 0
+```
+
+The jobs write to separate persistent Volume paths, so disconnecting the local
+terminal does not lose the videos. After both workers finish, download them with:
+
+```powershell
+.\download_brainrot_long_scheduled.ps1 `
+  -RunId "long-horizon-60s-scheduled" `
+  -OutputDir "output\brainrot-v-long-horizon-60s"
+```
+
+### Modal one-prompt inference
+
+The Modal app builds the complete CUDA/Python environment remotely, stores the
+Wan and Causal Forcing++ weights in a persistent Modal Volume, runs inference on
+an A100 80 GB, and downloads only the resulting MP4.
+
+Install and authenticate the lightweight local CLI once:
+
+```bash
+pip install modal
+modal setup
+```
+
+Then run the included entrypoint (Git Bash, WSL, Linux, or macOS):
+
+```bash
+./run_modal.sh "A cinematic tracking shot of a red fox running through a misty pine forest at sunrise" output/fox.mp4
+```
+
+PowerShell is supported too:
+
+```powershell
+.\run_modal.ps1 -Prompt "A cinematic tracking shot of a red fox running through a misty pine forest at sunrise" -Output output/fox.mp4
+```
+
+Or invoke Modal directly:
+
+```bash
+modal run modal_app.py \
+  --prompt "A cinematic tracking shot of a red fox running through a misty pine forest at sunrise" \
+  --output output/fox.mp4
+```
+
+The first run builds the image and downloads model weights; later runs reuse
+Modal's image cache and the `causal-forcing-models` Volume. Use `--seed` and
+`--num-frames` to override their defaults. The selected frame-wise model expects
+frame counts compatible with its one-frame blocks (the default is 21).
+
 #### T2V
 Chunk-wise model:
 ```bash
