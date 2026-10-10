@@ -23,5 +23,11 @@ memory_config:
   window_blocks: 12
   keep_tokens_per_block: 256
   bank_capacity: 2048
-  score_layers: [0, 14, 29]
+  # Eq. 7 averages saliency over heads *and layers*; all 30 are probed.
+  # Runs before 18 Sep used the three-layer approximation [0, 14, 29].
+  score_layers: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+                 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]
+  # Algorithm 1 line 7: saliency accrues to window tokens only; banked scores
+  # freeze at compression. "all" reproduces the pre-18 Sep behaviour.
+  saliency_scope: window
   probe_query_chunk: 32

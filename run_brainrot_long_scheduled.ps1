@@ -8,6 +8,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 $env:PYTHONUTF8 = "1"
+# The Modal CLI prints non-ASCII status glyphs; without this the default
+# Windows console codec raises and the submission is lost.
+$env:PYTHONIOENCODING = "utf-8"
 Set-Location $PSScriptRoot
 $LocalPython = Join-Path $PSScriptRoot ".modal-client\Scripts\python.exe"
 if (-not (Test-Path $LocalPython)) {
@@ -30,5 +33,6 @@ if ($LASTEXITCODE -ne 0) { throw "Baseline submission failed" }
 if ($LASTEXITCODE -ne 0) { throw "Brainrot-V submission failed" }
 
 Write-Host "Submitted independent persistent workers."
-Write-Host "Baseline volume path: $RunId-baseline/baseline.mp4"
-Write-Host "Brainrot-V volume path: $RunId-brainrot-v/brainrot_v.mp4"
+Write-Host "Baseline artifacts:   $RunId-baseline/{baseline.mp4,baseline.log,baseline.manifest.json}"
+Write-Host "Brainrot-V artifacts: $RunId-brainrot-v/{brainrot_v.mp4,brainrot_v.log,brainrot_v.manifest.json}"
+Write-Host "Fetch them with: .\download_brainrot_long_scheduled.ps1 -RunId $RunId"

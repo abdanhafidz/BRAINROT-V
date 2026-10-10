@@ -46,9 +46,10 @@ class AttnProbe:
     def _record(self, q: torch.Tensor, k: torch.Tensor, scale) -> None:
         scale = float(scale) if scale is not None else 1.0 / math.sqrt(q.shape[-1])
         column_sum = torch.zeros(k.shape[1], device=k.device, dtype=torch.float32)
+        keys = k.float()
         for start in range(0, q.shape[1], self.query_chunk):
             query = q[:, start:start + self.query_chunk].float()
-            logits = torch.einsum("bqhd,bkhd->bhqk", query, k.float()) * scale
+            logits = torch.einsum("bqhd,bkhd->bhqk", query, keys) * scale
             column_sum.add_(logits.softmax(dim=-1).sum(dim=(0, 1, 2)))
             self._query_count += query.shape[0] * query.shape[1] * query.shape[2]
         self._column_sum = (column_sum if self._column_sum is None

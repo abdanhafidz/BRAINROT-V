@@ -158,7 +158,10 @@ This writes `baseline-causal-forcing.mp4`, `proposed-brainrot-v.mp4`, and an
 For the continuous 60-second, duration-scheduled comparison, submit the baseline
 and Brainrot-V as separate persistent Modal workers. Each `[start-end seconds]`
 line in the prompt file becomes a timed condition while the autoregressive
-self-attention cache remains continuous:
+self-attention cache remains continuous. The declared span is what places the
+section in the rollout, so a non-uniform schedule such as `[0-20 seconds]` /
+`[20-25 seconds]` / `[25-60 seconds]` is rendered as written. Sections must be
+contiguous and start at zero, or the run is rejected before any GPU work:
 
 ```powershell
 .\run_brainrot_long_scheduled.ps1 `
@@ -176,13 +179,34 @@ self-attention cache remains continuous:
 ```
 
 The jobs write to separate persistent Volume paths, so disconnecting the local
-terminal does not lose the videos. After both workers finish, download them with:
+terminal does not lose the videos. Each worker also tees its stdout and stderr to
+`<mode>.log` on the Volume and commits it every two minutes, so a run that is
+still going — or one that failed — can be inspected without waiting for it or
+relying on the Modal console.
+
+After both workers finish, download the videos together with their logs,
+manifests and resolved schedules:
 
 ```powershell
 .\download_brainrot_long_scheduled.ps1 `
   -RunId "long-horizon-60s-scheduled" `
   -OutputDir "output\brainrot-v-long-horizon-60s"
 ```
+
+```bash
+./download_brainrot_long_scheduled.sh long-horizon-60s-scheduled
+```
+
+Each arm yields four files:
+
+| File | Contents |
+| --- | --- |
+| `*.mp4` | The generated video |
+| `*.log` | Full streamed output of the remote run |
+| `*.manifest.json` | Command, GPU, exit code, wall time, output SHA-256, status |
+| `*.schedule.json` | The prompt schedule the run actually resolved |
+
+A missing video fails the download; a missing log only warns.
 
 ### Modal one-prompt inference
 

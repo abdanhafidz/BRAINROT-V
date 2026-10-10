@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 export PYTHONUTF8=1
+# The Modal CLI prints non-ASCII status glyphs; without this the default
+# Windows console codec raises and the submission is lost.
+export PYTHONIOENCODING=utf-8
 cd "$(dirname "$0")"
 
 MODAL_COMMAND=(modal)
@@ -28,5 +31,6 @@ COMMON=(run --detach --quiet modal_brainrot.py::app.submit_one_long
   --run-id "$RUN_ID-brainrot-v"
 
 printf 'Submitted independent persistent workers.\n'
-printf 'Baseline volume path: %s-baseline/baseline.mp4\n' "$RUN_ID"
-printf 'Brainrot-V volume path: %s-brainrot-v/brainrot_v.mp4\n' "$RUN_ID"
+printf 'Baseline artifacts:   %s-baseline/{baseline.mp4,baseline.log,baseline.manifest.json}\n' "$RUN_ID"
+printf 'Brainrot-V artifacts: %s-brainrot-v/{brainrot_v.mp4,brainrot_v.log,brainrot_v.manifest.json}\n' "$RUN_ID"
+printf 'Fetch them with: ./download_brainrot_long_scheduled.sh %s\n' "$RUN_ID"

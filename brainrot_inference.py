@@ -2,6 +2,7 @@
 
 import argparse
 import hashlib
+import json
 from pathlib import Path
 import re
 
@@ -38,18 +39,92 @@ def parse_args():
     return parser.parse_args()
 
 
+# ``[0-5 seconds]``, ``[5 - 10 s]``, ``[10-15]`` -- the leading span marker of a
+# timed prompt line.  The two numbers are the section's start and end in seconds.
+_SPAN_MARKER = re.compile(
+    r"^\[\s*(\d+(?:\.\d+)?)\s*[-–]\s*(\d+(?:\.\d+)?)\s*(?:s|sec|secs|seconds)?\s*\]\s*")
+_ANY_MARKER = re.compile(r"^\[[^]]*\]\s*")
+
+
 def _read_prompts(args):
-    if args.prompt_file:
-        text = Path(args.prompt_file).read_text(encoding="utf-8")
-        prompts = []
-        for line in text.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            match = re.match(r"^\[[^]]+\]\s*(.*?)(?:\s*\|\s*)?$", line)
-            prompts.append((match.group(1) if match else line).strip())
-        return prompts
-    return [args.prompt.strip()]
+    """Return the prompt sections and, when declared, their time spans.
+
+    A timed prompt file states each section's own span.  Those declared spans are
+    authoritative: they are returned alongside the text so the caller can map them
+    onto latent-frame boundaries.  ``None`` means the file declared no spans and
+    an even split is the only defined schedule.
+    """
+    if not args.prompt_file:
+        return [args.prompt.strip()], None
+
+    text = Path(args.prompt_file).read_text(encoding="utf-8")
+    prompts, spans = [], []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        span_match = _SPAN_MARKER.match(line)
+        if span_match:
+            spans.append((float(span_match.group(1)), float(span_match.group(2))))
+            body = line[span_match.end():]
+        else:
+            spans.append(None)
+            body = _ANY_MARKER.sub("", line)
+        prompts.append(body.rstrip("|").strip())
+
+    if any(span is None for span in spans):
+        if any(span is not None for span in spans):
+            raise ValueError(
+                f"{args.prompt_file}: every prompt line must declare a time span, "
+                "or none may; a partially timed file has no defined schedule")
+        return prompts, None
+
+    for index in range(1, len(spans)):
+        if abs(spans[index][0] - spans[index - 1][1]) > 1e-6:
+            raise ValueError(
+                f"{args.prompt_file}: section {index + 1} starts at "
+                f"{spans[index][0]}s but section {index} ends at "
+                f"{spans[index - 1][1]}s; timed sections must be contiguous")
+    if spans[0][0] != 0.0:
+        raise ValueError(f"{args.prompt_file}: the first section must start at 0 seconds")
+    if any(end <= start for start, end in spans):
+        raise ValueError(f"{args.prompt_file}: every section must have positive duration")
+    return prompts, spans
+
+
+def _latent_frames_for_seconds(seconds, fps=16, temporal_stride=4):
+    """Smallest latent-frame count whose decode covers ``seconds`` of video.
+
+    ``n`` latent frames decode to ``(n - 1) * temporal_stride + 1`` pixel frames,
+    so this is that relation inverted and rounded to the nearest whole frame.
+    """
+    pixel_frames = seconds * fps
+    return int(round((pixel_frames - 1) / temporal_stride)) + 1
+
+
+def _boundaries_from_spans(spans, num_frames, total_seconds):
+    """Exclusive latent-frame boundaries honouring each section's declared span.
+
+    The declared schedule is rescaled onto the rollout that was actually
+    requested, so a 60-second prompt file stays correct when rendered at a
+    shorter duration for a smoke test.
+    """
+    declared_total = spans[-1][1]
+    scale = total_seconds / declared_total
+    boundaries, previous = [], 0
+    for index, (_, end) in enumerate(spans):
+        frame = _latent_frames_for_seconds(end * scale)
+        # Every section must own at least one latent frame, and the schedule must
+        # end exactly on the last frame of the rollout.
+        frame = max(previous + 1, min(frame, num_frames - (len(spans) - index - 1)))
+        boundaries.append(frame)
+        previous = frame
+    boundaries[-1] = num_frames
+    if boundaries != sorted(boundaries) or boundaries[0] < 1:
+        raise ValueError(
+            f"{len(spans)} timed sections cannot be scheduled over "
+            f"{num_frames} latent frames")
+    return boundaries
 
 
 def _section_counts(total_frames, section_count):
@@ -89,7 +164,7 @@ def _segmented_latent_rollout(pipeline, noise, prompts, segment_frames,
 
 def main():
     args = parse_args()
-    prompts = _read_prompts(args)
+    prompts, spans = _read_prompts(args)
     if not prompts or any(not prompt for prompt in prompts):
         raise ValueError("prompt must not be empty")
     if args.num_output_frames < 1 or args.sampling_steps < 1:
@@ -137,6 +212,25 @@ def main():
     pipeline.generator.to(device=gpu)
     pipeline.vae.to(device=gpu)
 
+    total_seconds = ((args.num_output_frames - 1) * 4 + 1) / 16
+    boundaries = None
+    if spans is not None and len(prompts) > 1:
+        boundaries = _boundaries_from_spans(
+            spans, args.num_output_frames, total_seconds)
+    print(f"Rollout: {args.num_output_frames} latent frames "
+          f"-> {(args.num_output_frames - 1) * 4 + 1} pixel frames "
+          f"({total_seconds:.4f}s at 16 FPS)")
+    if boundaries is not None:
+        previous = 0
+        for (start, end), frame in zip(spans, boundaries):
+            print(f"  section [{start:g}-{end:g}s] -> latent frames "
+                  f"[{previous}, {frame}) "
+                  f"= {((previous - 1) * 4 + 1) / 16 if previous else 0:.4f}"
+                  f"-{((frame - 1) * 4 + 1) / 16:.4f}s")
+            previous = frame
+    elif len(prompts) > 1:
+        print(f"  {len(prompts)} untimed sections -> even latent-frame split")
+
     noise = torch.randn(
         [1, args.num_output_frames, 16, 60, 104],
         device=device, dtype=torch.bfloat16)
@@ -146,7 +240,8 @@ def main():
         video = pipeline.vae.decode_to_pixel(latents)
         video = (video * 0.5 + 0.5).clamp(0, 1)
     else:
-        video = pipeline.inference(noise=noise, text_prompts=prompts)
+        video = pipeline.inference(noise=noise, text_prompts=prompts,
+                                   prompt_boundaries=boundaries)
     video = 255.0 * rearrange(video, "b t c h w -> b t h w c").cpu()
 
     prompt_text = "\n".join(prompts)
@@ -156,7 +251,43 @@ def main():
     output.parent.mkdir(parents=True, exist_ok=True)
     write_video(str(output), video[0], fps=16)
     pipeline.vae.model.clear_cache()
+
+    # The resolved schedule is part of the result, not just a log line: without it
+    # a finished MP4 cannot be checked against the schedule it claims to realize.
+    sections = None
+    if boundaries is not None:
+        sections, start = [], 0
+        for index, end in enumerate(boundaries):
+            sections.append({
+                "index": index,
+                "declared_span_seconds": list(spans[index]),
+                "latent_range": [start, end],
+                "seconds_range": [
+                    round(((start - 1) * 4 + 1) / 16, 4) if start else 0.0,
+                    round(((end - 1) * 4 + 1) / 16, 4)],
+                "text": prompts[index],
+            })
+            start = end
+
+    schedule = output.with_suffix(".schedule.json")
+    schedule.write_text(json.dumps({
+        "mode": args.mode,
+        "seed": args.seed,
+        "sampling_steps": args.sampling_steps,
+        "latent_frames": args.num_output_frames,
+        "pixel_frames": int(video.shape[1]),
+        "fps": 16,
+        "duration_seconds": round(total_seconds, 4),
+        "prompt_file": args.prompt_file,
+        "prompt_sha256": hashlib.sha256(prompt_text.encode("utf-8")).hexdigest(),
+        "section_count": len(prompts),
+        "schedule_source": ("declared" if boundaries is not None
+                            else "even-split" if len(prompts) > 1 else "single"),
+        "latent_boundaries": boundaries,
+        "sections": sections,
+    }, indent=2), encoding="utf-8")
     print(f"Video saved to {output.resolve()}")
+    print(f"Schedule saved to {schedule.resolve()}")
 
 
 if __name__ == "__main__":

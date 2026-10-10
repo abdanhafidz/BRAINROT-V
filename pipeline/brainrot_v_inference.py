@@ -44,6 +44,19 @@ class BrainrotVInferencePipeline(CausalDiffusionInferencePipeline):
             steady_capacity = self.memory.capacity() - self.memory.block_len
             if steady_capacity > self.max_train_frames * self.frame_seq_length:
                 raise ValueError("memory_config capacity exceeds the training horizon")
+            # One banked summary costs one temporal frame, so the summary count
+            # is bounded by the checkpoint horizon rather than by tokens alone.
+            budget = self.memory.group_budget(self.max_train_frames)
+            if budget < 1:
+                raise ValueError(
+                    "sink and window leave no temporal frames for the memory bank")
+            self.memory.group_limit = min(self.memory.group_limit, budget)
+            # Frame-aligned packing spends whole temporal frames on the bank, so
+            # the logical timeline is checked separately from the physical one.
+            if self.memory.logical_frames() > self.max_train_frames:
+                raise ValueError(
+                    f"memory_config needs {self.memory.logical_frames()} temporal "
+                    f"frames, beyond the {self.max_train_frames}-frame horizon")
             self.probe.install()
 
     def _initialize_kv_cache(self, batch_size, dtype, device):
@@ -64,6 +77,17 @@ class BrainrotVInferencePipeline(CausalDiffusionInferencePipeline):
                                                     device=device),
                 })
 
+    def _set_read_index(self, index) -> None:
+        """Restrict (or release) what the cached attention may read."""
+        for cache in (self.kv_cache_pos, self.kv_cache_neg):
+            if cache is None:
+                continue
+            for layer in cache:
+                if index is None:
+                    layer.pop("read_index", None)
+                else:
+                    layer["read_index"] = index
+
     def _run(self, latents, cond, timestep, cache, xattn, record=False):
         if record:
             self.probe.begin_block()
@@ -73,7 +97,10 @@ class BrainrotVInferencePipeline(CausalDiffusionInferencePipeline):
             timestep=timestep,
             kv_cache=cache,
             crossattn_cache=xattn,
-            current_start=self.memory.filled_len,
+            # Temporal position comes from the frame-aligned logical cursor; the
+            # attention layer derives the physical write slot from the split
+            # between its global (logical) and local (physical) end indices.
+            current_start=self.memory.logical_end,
             cache_start=0,
         )
 
@@ -93,21 +120,49 @@ class BrainrotVInferencePipeline(CausalDiffusionInferencePipeline):
         for layer in cache:
             layer["is_init"] = False
 
-    def _scheduled_conditioning(self, text_prompts: List[str], num_frames: int):
+    @staticmethod
+    def _validate_boundaries(boundaries: List[int], num_frames: int,
+                             prompt_count: int) -> List[int]:
+        boundaries = [int(value) for value in boundaries]
+        if len(boundaries) != prompt_count:
+            raise ValueError(
+                f"prompt_boundaries has {len(boundaries)} entries for "
+                f"{prompt_count} prompt sections")
+        if boundaries[-1] != num_frames:
+            raise ValueError(
+                f"the last prompt boundary must be {num_frames}, "
+                f"got {boundaries[-1]}")
+        if boundaries[0] < 1 or any(
+                later <= earlier
+                for earlier, later in zip(boundaries, boundaries[1:])):
+            raise ValueError(
+                "prompt_boundaries must be strictly increasing and give every "
+                f"section at least one latent frame: {boundaries}")
+        return boundaries
+
+    def _scheduled_conditioning(self, text_prompts: List[str], num_frames: int,
+                                boundaries: Optional[List[int]] = None):
         # Encode each section independently. This avoids truncating one flattened
         # 60-second prompt at the text encoder's 512-token limit.
         conditions = [self.text_encoder(text_prompts=[prompt])
                       for prompt in text_prompts]
         unconditional = self.text_encoder(
             text_prompts=[self.args.negative_prompt])
-        return conditions, unconditional, self._prompt_boundaries(
-            num_frames, len(text_prompts))
+        # A timed prompt file declares its own section spans. Honour them when
+        # given; an even split is the fallback for an untimed file only.
+        if boundaries is None:
+            boundaries = self._prompt_boundaries(num_frames, len(text_prompts))
+        else:
+            boundaries = self._validate_boundaries(
+                boundaries, num_frames, len(text_prompts))
+        return conditions, unconditional, boundaries
 
     @torch.no_grad()
     def _baseline_scheduled_inference(self, noise: torch.Tensor,
                                       text_prompts: List[str],
                                       return_latents: bool,
-                                      return_video: bool):
+                                      return_video: bool,
+                                      prompt_boundaries: Optional[List[int]] = None):
         """Continuous rolling baseline with timed cross-attention changes."""
         batch_size, num_frames, channels, height, width = noise.shape
         if batch_size != 1:
@@ -116,7 +171,7 @@ class BrainrotVInferencePipeline(CausalDiffusionInferencePipeline):
             raise ValueError("num_frames must be divisible by num_frame_per_block")
 
         conditions, uncond, boundaries = self._scheduled_conditioning(
-            text_prompts, num_frames)
+            text_prompts, num_frames, prompt_boundaries)
         output = torch.zeros_like(noise)
         if self.kv_cache_pos is None:
             self._initialize_kv_cache(batch_size, noise.dtype, noise.device)
@@ -187,27 +242,27 @@ class BrainrotVInferencePipeline(CausalDiffusionInferencePipeline):
     @torch.no_grad()
     def _compact(self):
         old_len = self.memory.filled_len
-        old_position_frames = self.memory.position_frames.clone()
         keep = self.memory.select()
         if keep is None:
             return
-        old_frames = old_position_frames[keep]
-        new_slots = torch.arange(keep.numel(), device=keep.device)
-        new_frames = new_slots // self.frame_seq_length
+        old_frames = self.memory.reanchor_from
+        new_frames = self.memory.position_frames
         freqs = self.generator.model.freqs
         for cache in (self.kv_cache_pos, self.kv_cache_neg):
-            BrainrotVMemory.apply_(cache, keep, old_len, keep.numel())
+            BrainrotVMemory.apply_(cache, keep, old_len, self.memory.logical_end)
             for layer in cache:
                 reanchor_temporal_(layer["k"], old_frames, new_frames, freqs)
-        self.memory.position_frames = new_frames
-        self.memory.logical_end = self.memory.filled_len
 
     @torch.no_grad()
     def inference(self, noise: torch.Tensor, text_prompts: List[str],
                   initial_latent: Optional[torch.Tensor] = None,
                   return_latents: bool = False,
                   start_frame_index: Optional[int] = 0,
-                  return_video: bool = True):
+                  return_video: bool = True,
+                  prompt_boundaries: Optional[List[int]] = None):
+        if prompt_boundaries is not None and len(prompt_boundaries) != len(text_prompts):
+            raise ValueError(
+                "prompt_boundaries must have one entry per prompt section")
         if self.memory.cfg.mode == "baseline" and len(text_prompts) == 1:
             return super().inference(noise, text_prompts, initial_latent,
                                      return_latents, start_frame_index,
@@ -217,7 +272,8 @@ class BrainrotVInferencePipeline(CausalDiffusionInferencePipeline):
                 raise ValueError(
                     "timed baseline scheduling does not support initial_latent")
             return self._baseline_scheduled_inference(
-                noise, text_prompts, return_latents, return_video)
+                noise, text_prompts, return_latents, return_video,
+                prompt_boundaries)
         if self.independent_first_frame:
             raise NotImplementedError("BRAINROT-V currently requires independent_first_frame=false")
 
@@ -241,7 +297,7 @@ class BrainrotVInferencePipeline(CausalDiffusionInferencePipeline):
             boundaries = [num_frames]
         else:
             conditions, uncond, boundaries = self._scheduled_conditioning(
-                text_prompts, num_frames)
+                text_prompts, num_frames, prompt_boundaries)
         prompt_index = 0
         cond = conditions[0]
         output = torch.zeros(
@@ -278,7 +334,7 @@ class BrainrotVInferencePipeline(CausalDiffusionInferencePipeline):
                           self.crossattn_cache_neg)
                 output[:, context_index:context_index + self.num_frame_per_block] = context
                 self.memory.note_append(block_len, noise.device,
-                                        self.memory.filled_len)
+                                        self.memory.logical_end)
                 self._compact()
 
         output_frame_index = 0
@@ -288,8 +344,12 @@ class BrainrotVInferencePipeline(CausalDiffusionInferencePipeline):
                 cond = conditions[prompt_index]
                 self._reset_cross_attention(self.crossattn_cache_pos)
             n_frames = self.num_frame_per_block
-            assert_within_horizon(self.memory.filled_len, block_len,
+            assert_within_horizon(self.memory.logical_end, block_len,
                                   self.frame_seq_length, self.max_train_frames)
+            # Algorithm 1 line 3: assemble the context for this block. Sparse
+            # recall applies to the denoising passes, which generate the frame.
+            self._set_read_index(
+                self.memory.read_index(block_len, noise.device))
             latents = noise[:, output_frame_index:output_frame_index + n_frames]
             scheduler = self._initialize_sample_scheduler(noise)
             for t in tqdm(scheduler.timesteps):
@@ -312,6 +372,10 @@ class BrainrotVInferencePipeline(CausalDiffusionInferencePipeline):
             zero_t = torch.zeros(
                 [batch_size, n_frames], device=noise.device,
                 dtype=torch.float32)
+            # The clean-context pass writes this block's KV and is read densely:
+            # its probe supplies both the window saliency of Eq. 7 and the
+            # query-key recall scores the next block selects on.
+            self._set_read_index(None)
             self._run(latents, cond, zero_t, self.kv_cache_pos,
                       self.crossattn_cache_pos, record=True)
             column_sum, query_count = self.probe.pop()
@@ -319,9 +383,10 @@ class BrainrotVInferencePipeline(CausalDiffusionInferencePipeline):
                       self.crossattn_cache_neg)
 
             self.memory.note_append(block_len, noise.device,
-                                    self.memory.filled_len)
+                                    self.memory.logical_end)
             if column_sum is not None:
                 self.memory.accumulate(column_sum, query_count)
+                self.memory.note_recall(column_sum)
             self._compact()
             output_frame_index += n_frames
 

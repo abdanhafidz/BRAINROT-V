@@ -230,11 +230,23 @@ class CausalWanSelfAttention(nn.Module):
                 local_start_index = local_end_index - num_new_tokens
                 kv_cache["k"][:, local_start_index:local_end_index] = roped_key
                 kv_cache["v"][:, local_start_index:local_end_index] = v
-            x = attention(
-                roped_query,
-                kv_cache["k"][:, max(0, local_end_index - self.max_attention_size):local_end_index],
-                kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
-            )
+            # BRAINROT-V Algorithm 1 line 3 assembles the context as
+            # S | TopK(G; Q_n) | W before reading. When the caller supplies that
+            # set as "read_index", attend over exactly those slots; otherwise
+            # fall back to the contiguous window this model normally uses.
+            read_index = kv_cache.get("read_index")
+            if read_index is not None:
+                x = attention(
+                    roped_query,
+                    kv_cache["k"][:, read_index],
+                    kv_cache["v"][:, read_index],
+                )
+            else:
+                x = attention(
+                    roped_query,
+                    kv_cache["k"][:, max(0, local_end_index - self.max_attention_size):local_end_index],
+                    kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
+                )
             kv_cache["global_end_index"].fill_(current_end)
             kv_cache["local_end_index"].fill_(local_end_index)
 
